@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	TLSNAME = "(TLS)"
+	TLSNAME        = "(TLS)"
+	R_CALLIND_NAME = "R_CALLIND"
 )
 
 type interfaceHeader struct {
@@ -35,8 +36,9 @@ func block()
 // RegSymbol register common types for relocation
 func RegSymbol(symPtr map[string]uintptr) {
 
+	var int0 = int(0)
 	RegTypes(symPtr, int(0), int8(0), int16(0), int32(0),
-		int64(0), uint(0), uint8(0), uint16(0), uint32(0), uint64(0), true,
+		int64(0), uint(0), uint8(0), uint16(0), uint32(0), uint64(0), true, &int0,
 		"", []byte{}, []uint{}, []int{}, uintptr(0), make(chan bool, 1), unsafe.Pointer(&symPtr))
 	RegFunc(symPtr, "runtime.block", block)
 
@@ -53,23 +55,27 @@ func RegSymbol(symPtr map[string]uintptr) {
 		} else if strings.HasPrefix(sym.Name, "runtime.") {
 			symPtr[sym.Name] = uintptr(sym.Addr)
 		} else if strings.HasPrefix(sym.Name, "go.itab") {
-			symPtr[sym.Name] = uintptr(sym.Addr)
-			bs := strings.TrimLeft(sym.Name, "go.itab.")
-			bss := strings.Split(bs, ",")
-			ptrs := *(*[2]uintptr)(unsafe.Pointer(uintptr(sym.Addr)))
-			for i, ptr := range ptrs {
-				typeName := bss[len(bss)-i-1]
-				if typeName[0] == '*' {
-					var obj interface{} = reflect.TypeOf(0)
-					(*interfaceHeader)(unsafe.Pointer(&obj)).word = unsafe.Pointer(ptr)
-					typ := obj.(reflect.Type).Elem()
-					obj = typ
-					typePtr := uintptr((*interfaceHeader)(unsafe.Pointer(&obj)).word)
-					symPtr["type."+typeName[1:]] = typePtr
-				}
-				symPtr["type."+typeName] = ptr
-			}
+			RegItab(symPtr, sym.Name, uintptr(sym.Addr))
 		}
+	}
+}
+
+func RegItab(symPtr map[string]uintptr, name string, addr uintptr) {
+	symPtr[name] = uintptr(addr)
+	bs := strings.TrimLeft(name, "go.itab.")
+	bss := strings.Split(bs, ",")
+	ptrs := *(*[2]uintptr)(unsafe.Pointer(addr))
+	for i, ptr := range ptrs {
+		typeName := bss[len(bss)-i-1]
+		if typeName[0] == '*' {
+			var obj interface{} = reflect.TypeOf(0)
+			(*interfaceHeader)(unsafe.Pointer(&obj)).word = unsafe.Pointer(ptr)
+			typ := obj.(reflect.Type).Elem()
+			obj = typ
+			typePtr := uintptr((*interfaceHeader)(unsafe.Pointer(&obj)).word)
+			symPtr["type."+typeName[1:]] = typePtr
+		}
+		symPtr["type."+typeName] = ptr
 	}
 }
 

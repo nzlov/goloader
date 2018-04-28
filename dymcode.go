@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -87,6 +88,7 @@ type Reloc struct {
 	Add    int
 }
 
+// CodeReloc dispatch and load CodeReloc struct via network is OK
 type CodeReloc struct {
 	Code []byte
 	Data []byte
@@ -97,18 +99,33 @@ type CodeReloc struct {
 type CodeModule struct {
 	Syms       map[string]uintptr
 	CodeByte   []byte
-	Module     *moduledata
+	Module     interface{}
 	pcfuncdata []findfuncbucket
 	stkmaps    [][]byte
+	itabs      []itabReloc
+	itabSyms   []itabSym
+	typemap    map[typeOff]uintptr
+}
+
+type itabSym struct {
+	ptr   int
+	inter int
+	_type int
+}
+
+type itabReloc struct {
+	locOff int
+	symOff int
+	pc     int
 }
 
 var (
-	fmodule     *moduledata
-	tmpModule   *moduledata
+	tmpModule   interface{}
+	modules     = make(map[interface{}]bool)
 	modulesLock sync.Mutex
 )
 
-func ReadObj(f io.ReadSeeker) (*CodeReloc, error) {
+func ReadObj(f *os.File) (*CodeReloc, error) {
 	obj, err := goobj.Parse(f, "main")
 	if err != nil {
 		return nil, fmt.Errorf("read error: %v", err)
@@ -200,18 +217,26 @@ func relocSym(reloc *CodeReloc, f io.ReadSeeker, sym *goobj.Sym,
 			exSym.Offset = -1
 			if re.Type == R_TLS_LE {
 				exSym.Name = TLSNAME
-				exSym.Offset = re.Offset
+				exSym.Offset = int(re.Offset)
 			}
 			if re.Type == R_CALLIND {
 				exSym.Offset = 0
-				exSym.Name = "R_CALLIND"
+				exSym.Name = R_CALLIND_NAME
+			}
+			if strings.HasPrefix(exSym.Name, "type..importpath.") {
+				path := strings.TrimLeft(exSym.Name, "type..importpath.")
+				path = strings.Trim(path, ".")
+				pathb := []byte(path)
+				pathb = append(pathb, 0)
+				exSym.Offset = len(reloc.Data)
+				reloc.Data = append(reloc.Data, pathb...)
 			}
 			symOff = addSym(symMap, &reloc.Syms, &exSym)
 		}
 		rsym.Reloc = append(rsym.Reloc,
-			Reloc{Offset: re.Offset + rsym.Offset, SymOff: symOff,
+			Reloc{Offset: int(re.Offset) + rsym.Offset, SymOff: symOff,
 				Type: int(re.Type),
-				Size: re.Size, Add: re.Add})
+				Size: int(re.Size), Add: int(re.Add)})
 	}
 	reloc.Syms[curSymOffset].Reloc = rsym.Reloc
 
@@ -228,14 +253,16 @@ func strWrite(buf *bytes.Buffer, str ...string) {
 }
 
 func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
-	codeLen := len(code.Code) + len(code.Data)
-	codeByte, err := mmap(codeLen)
+	pCodeLen := len(code.Code) + len(code.Data)
+	codeLen := int(float32(pCodeLen) * 1.5)
+	codeByte, err := Mmap(codeLen)
 	if err != nil {
 		return nil, err
 	}
 
 	var codeModule = CodeModule{
-		Syms: make(map[string]uintptr),
+		Syms:    make(map[string]uintptr),
+		typemap: make(map[typeOff]uintptr),
 	}
 	var errBuf bytes.Buffer
 
@@ -243,9 +270,10 @@ func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
 	dataBase := base + len(code.Code)
 
 	var symAddrs = make([]int, len(code.Syms))
-
+	var itabIndexs []int
+	var funcTypeMap = make(map[string]*int)
 	for i, sym := range code.Syms {
-		if sym.Offset == -1 || strings.HasPrefix(sym.Name, "go.itab") {
+		if sym.Offset == -1 {
 			if ptr, ok := symPtr[sym.Name]; ok {
 				symAddrs[i] = int(ptr)
 			} else {
@@ -257,15 +285,48 @@ func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
 		} else if sym.Kind == STEXT {
 			symAddrs[i] = code.Syms[i].Offset + base
 			codeModule.Syms[sym.Name] = uintptr(symAddrs[i])
+		} else if strings.HasPrefix(sym.Name, "go.itab") {
+			if ptr, ok := symPtr[sym.Name]; ok {
+				symAddrs[i] = int(ptr)
+			} else {
+				itabIndexs = append(itabIndexs, i)
+			}
 		} else {
 			symAddrs[i] = code.Syms[i].Offset + dataBase
+
+			if strings.HasPrefix(sym.Name, "type.func") {
+				funcTypeMap[sym.Name] = &symAddrs[i]
+			}
 		}
 	}
 
+	var itabSymMap = make(map[string]int)
+	for _, itabIndex := range itabIndexs {
+		curSym := code.Syms[itabIndex]
+		sym1 := symAddrs[curSym.Reloc[0].SymOff]
+		sym2 := symAddrs[curSym.Reloc[1].SymOff]
+		itabSymMap[curSym.Name] = len(codeModule.itabSyms)
+		codeModule.itabSyms = append(codeModule.itabSyms, itabSym{inter: sym1, _type: sym2})
+
+		addIFaceSubFuncType(funcTypeMap, codeModule.typemap,
+			(*interfacetype)(unsafe.Pointer(uintptr(sym1))), base)
+	}
+
+	var armcode = []byte{0x04, 0xF0, 0x1F, 0xE5, 0x00, 0x00, 0x00, 0x00}
+	var x86code = []byte{0xff, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	var movcode byte = 0x8b
+	var leacode byte = 0x8d
+	var jmpOff = pCodeLen
 	for _, curSym := range code.Syms {
 		for _, loc := range curSym.Reloc {
 			sym := code.Syms[loc.SymOff]
 			if symAddrs[loc.SymOff] == -1 {
+				continue
+			}
+			if symAddrs[loc.SymOff] == 0 && strings.HasPrefix(sym.Name, "go.itab") {
+				codeModule.itabs = append(codeModule.itabs,
+					itabReloc{locOff: loc.Offset, symOff: itabSymMap[sym.Name],
+						pc: base + loc.Offset + loc.Size - loc.Add})
 				continue
 			}
 
@@ -283,31 +344,81 @@ func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
 				}
 				offset = symAddrs[loc.SymOff] - (addrBase + loc.Offset + loc.Size) + loc.Add
 				if offset > 2147483647 || offset < -2147483647 {
-					errBuf.WriteString(fmt.Sprint("offset overflow:", offset, "sym:", sym.Name, "\n"))
+					if jmpOff+8 > codeLen {
+						strWrite(&errBuf, "len overflow", "sym:", sym.Name, "\n")
+						continue
+					}
+					rb := relocByte[loc.Offset-2:]
+					if loc.Type == R_CALL {
+						offset = (base + jmpOff) - (addrBase + loc.Offset + loc.Size)
+						copy(codeByte[jmpOff:], x86code)
+						binary.LittleEndian.PutUint32(relocByte[loc.Offset:], uint32(offset))
+						binary.LittleEndian.PutUint32(codeByte[jmpOff+6:], uint32(symAddrs[loc.SymOff]+loc.Add))
+						jmpOff += len(x86code)
+					} else if rb[0] == leacode || rb[0] == movcode {
+						offset = (base + jmpOff) - (addrBase + loc.Offset + loc.Size)
+						binary.LittleEndian.PutUint32(relocByte[loc.Offset:], uint32(offset))
+						rb[0] = movcode
+						binary.LittleEndian.PutUint32(codeByte[jmpOff:], uint32(symAddrs[loc.SymOff]+loc.Add))
+						jmpOff += 8
+					} else {
+						strWrite(&errBuf, "offset overflow sym:", sym.Name, "\n")
+						binary.LittleEndian.PutUint32(relocByte[loc.Offset:], uint32(offset))
+					}
+					continue
 				}
-				// fmt.Println(curSym.Name, sym.Name, addrBase, symAddrs[loc.SymOff], offset, loc.Type, loc.Offset)
 				binary.LittleEndian.PutUint32(relocByte[loc.Offset:], uint32(offset))
+			case R_CALLARM:
+				add := loc.Add & 0xffffff
+				if add > 256 {
+					add = 0
+				} else {
+					add += 2
+				}
+				offset = (symAddrs[loc.SymOff] - (base + loc.Offset + 8) + add) / 4
+				if offset > 0x7fffff || offset < -0x7fffff {
+					if jmpOff+4 > codeLen {
+						strWrite(&errBuf, "len overflow", "sym:", sym.Name, "\n")
+						continue
+					}
+					align := jmpOff % 4
+					if align != 0 {
+						jmpOff += (4 - align)
+					}
+					offset = (jmpOff - (loc.Offset + 8)) / 4
+					var v = uint32(offset)
+					b := code.Code[loc.Offset:]
+					b[0] = byte(v)
+					b[1] = byte(v >> 8)
+					b[2] = byte(v >> 16)
+					copy(codeByte[jmpOff:], armcode)
+					binary.LittleEndian.PutUint32(codeByte[jmpOff+4:], uint32(symAddrs[loc.SymOff]+add*4))
+					jmpOff += len(armcode)
+					continue
+				}
+				b := code.Code[loc.Offset:]
+				var v = uint32(offset)
+				b[0] = byte(v)
+				b[1] = byte(v >> 8)
+				b[2] = byte(v >> 16)
 			case R_ADDR:
 				var relocByte = code.Data
 				if curSym.Kind == STEXT {
 					relocByte = code.Code
 				}
 				offset = symAddrs[loc.SymOff] + loc.Add
-				// fmt.Println(curSym.Name, sym.Name, sym.Offset, symAddrs[loc.SymOff], loc.Add, offset)
 				*(*uintptr)(unsafe.Pointer(&(relocByte[loc.Offset:][0]))) = uintptr(offset)
 			case R_CALLIND:
 
 			case R_ADDROFF, R_WEAKADDROFF, R_METHODOFF:
 				var relocByte = code.Data
-				var addrBase = dataBase
+				var addrBase = base
 				if curSym.Kind == STEXT {
-					addrBase = base
-					relocByte = code.Code
+					strWrite(&errBuf, "impossible!", sym.Name, "locate on code segment", "\n")
 				}
 				offset = symAddrs[loc.SymOff] - addrBase + loc.Add
 				binary.LittleEndian.PutUint32(relocByte[loc.Offset:], uint32(offset))
 			default:
-				// fmt.Println("unknown reloc type:", loc.Type, sym.Name)
 				strWrite(&errBuf, "unknown reloc type:", strconv.Itoa(loc.Type), sym.Name, "\n")
 			}
 
@@ -325,9 +436,9 @@ func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
 	module.minpc = (uintptr)(unsafe.Pointer(&codeByte[0]))
 	module.maxpc = (uintptr)(unsafe.Pointer(&codeByte[len(code.Code)-1])) + 2
 	module.filetab = code.Mod.filetab
-	module.typemap = make(map[typeOff]uintptr)
-	module.types = uintptr(dataBase)
-	module.etypes = uintptr(dataBase + len(code.Data))
+	module.typemap = codeModule.typemap
+	module.types = uintptr(base)
+	module.etypes = uintptr(base + codeLen)
 	module.text = uintptr(base)
 	module.etext = uintptr(base + len(code.Code))
 	codeModule.pcfuncdata = code.Mod.pcfunc // hold reference
@@ -344,7 +455,7 @@ func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
 			pclnOff += 4
 		}
 		module.ftab[i].funcoff = uintptr(pclnOff)
-		fi := &code.Mod.funcinfo[i-1]
+		fi := code.Mod.funcinfo[i-1]
 		fi.entry = module.ftab[i].entry
 		copy2Slice(module.pclntable[pclnOff:],
 			unsafe.Pointer(&fi._func), _funcSize)
@@ -357,8 +468,10 @@ func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
 			pclnOff += size
 		}
 
-		for i, v := range fi.funcdata {
-			fi.funcdata[i] = (uintptr)(unsafe.Pointer(&(code.Mod.stkmaps[v][0])))
+		var funcdata = make([]uintptr, len(fi.funcdata))
+		copy(funcdata, fi.funcdata)
+		for i, v := range funcdata {
+			funcdata[i] = (uintptr)(unsafe.Pointer(&(code.Mod.stkmaps[v][0])))
 		}
 		ptr := (uintptr)(unsafe.Pointer(&module.pclntable[pclnOff-1])) + 1
 		if PtrSize == 8 && ptr&4 != 0 {
@@ -368,7 +481,7 @@ func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
 		}
 		funcDataSize := int(PtrSize * fi.nfuncdata)
 		copy2Slice(module.pclntable[pclnOff:],
-			unsafe.Pointer(&fi.funcdata[0]), funcDataSize)
+			unsafe.Pointer(&funcdata[0]), funcDataSize)
 		pclnOff += funcDataSize
 
 	}
@@ -378,28 +491,31 @@ func Load(code *CodeReloc, symPtr map[string]uintptr) (*CodeModule, error) {
 	}
 
 	modulesLock.Lock()
-	var firstModule = &firstmoduledata
-	tmpModule = &module
-	if fmodule != nil {
-		firstModule = fmodule
-	} else {
-		fmodule = tmpModule
-	}
-	for datap := firstModule; ; {
-		nextdatap := datap.next
-		if nextdatap == nil {
-			datap.next = tmpModule
-			break
-		}
-		datap = nextdatap
-	}
-	codeModule.Module = tmpModule
-	tmpModule = nil
+	addModule(&codeModule, &module, runtime.Version())
 	modulesLock.Unlock()
 
 	copy(codeByte, code.Code)
 	copy(codeByte[len(code.Code):], code.Data)
 	codeModule.CodeByte = codeByte
+
+	for i := range codeModule.itabSyms {
+		it := &codeModule.itabSyms[i]
+		it.ptr = getitab(it.inter, it._type, false)
+	}
+	for _, it := range codeModule.itabs {
+		symAddr := codeModule.itabSyms[it.symOff].ptr
+		offset := symAddr - it.pc
+		if offset > 2147483647 || offset < -2147483647 {
+			offset = (base + jmpOff) - it.pc
+			binary.LittleEndian.PutUint32(codeByte[it.locOff:], uint32(offset))
+			codeByte[it.locOff-2:][0] = movcode
+			*(*uintptr)(unsafe.Pointer(&(codeByte[jmpOff:][0]))) = uintptr(symAddr)
+			jmpOff += PtrSize
+			continue
+		}
+		binary.LittleEndian.PutUint32(codeByte[it.locOff:], uint32(offset))
+	}
+
 	if errBuf.Len() > 0 {
 		return &codeModule, errors.New(errBuf.String())
 	}
@@ -418,18 +534,7 @@ func copy2Slice(dst []byte, src unsafe.Pointer, size int) {
 func (cm *CodeModule) Unload() {
 	runtime.GC()
 	modulesLock.Lock()
-	prevp := &firstmoduledata
-	for datap := &firstmoduledata; datap != nil; {
-		nextdatap := datap.next
-		if datap == cm.Module {
-			prevp.next = nextdatap
-		}
-		prevp = datap
-		datap = nextdatap
-	}
-	if fmodule == cm.Module && fmodule != nil {
-		fmodule = fmodule.next
-	}
+	removeModule(cm.Module, runtime.Version())
 	modulesLock.Unlock()
-	munmap(cm.CodeByte)
+	Munmap(cm.CodeByte)
 }
